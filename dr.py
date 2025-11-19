@@ -1,27 +1,8 @@
-"""
-Drowsiness detection for office workers
-Uses: OpenCV, dlib (optional), MediaPipe, TensorFlow (optional)
-
-This updated version adds:
- - per-user calibration to compute baseline EAR (no training required)
- - adaptive EAR thresholding based on calibration
- - improved fusion logic (PERCLOS, long closure, yawning) with smoothing
- - ability to run calibration at startup and reuse baseline
- - dd.run accepts an existing cv2.VideoCapture to allow calibration before run
-
-How to use (quick):
- 1. Install: pip install opencv-python mediapipe imutils
-    (tensorflow and dlib are optional)
- 2. Run: python drowsiness_detector.py
-    Use --use_dlib if you have dlib and the predictor file.
-    Add --no_calib to skip calibration.
-
-"""
-
 import os
 import time
 import argparse
 import threading
+import platform
 from collections import deque
 
 import cv2
@@ -47,18 +28,26 @@ try:
 except Exception:
     HAS_TF = False
 
+# optional text-to-speech for alarm
+try:
+    import pyttsx3
+    HAS_TTS = True
+except Exception:
+    HAS_TTS = False
+
 # ---------------------- Configuration & helpers ----------------------
 DLIB_LANDMARK_PATH = "shape_predictor_68_face_landmarks.dat"  # optional
 DEFAULT_MODEL_PATH = "eye_classifier.h5"
 
 # thresholds and parameters (tweak these for your environment)
-EAR_CONSEC_FRAMES = 15      # number of consecutive frames indicating eye closed to trigger drowsiness
-EAR_THRESHOLD = 0.22        # fallback EAR threshold
-PERCLOS_WINDOW = 150        # frames for PERCLOS window (~seconds * fps)
-PERCLOS_THRESHOLD = 0.4     # percent of time eyes closed in window to trigger drowsiness
-MAR_THRESHOLD = 0.6         # mouth aspect ratio threshold to consider yawning
+CLOSED_SECONDS_THRESHOLD = 2.0  # seconds eyes must stay closed to trigger long-closure alarm
+EAR_CONSEC_FRAMES = 15          # legacy frame-based threshold (kept for compatibility)
+EAR_THRESHOLD = 0.22            # fallback EAR threshold
+PERCLOS_WINDOW = 150            # frames for PERCLOS window (~seconds * fps)
+PERCLOS_THRESHOLD = 0.4         # percent of time eyes closed in window to trigger drowsiness
+MAR_THRESHOLD = 0.6             # mouth aspect ratio threshold to consider yawning
 YAWN_CONSEC_FRAMES = 10
-ALERT_PERSIST_FRAMES = 3    # require this many consecutive drowsy checks before alarming
+ALERT_PERSIST_FRAMES = 1        # require this many consecutive drowsy checks before alarming
 
 # convenience
 def shape_to_np(shape, dtype="int"):
@@ -90,13 +79,35 @@ def mouth_aspect_ratio(mouth):
     mar = (A + B) / (2.0 * C) if C != 0 else 0
     return mar
 
-# simple visual alarm
-def play_beep():
-    beep = np.zeros((100, 300, 3), dtype=np.uint8)
-    cv2.putText(beep, "DROWSINESS ALERT", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-    cv2.imshow("ALERT", beep)
-    cv2.waitKey(500)
-    cv2.destroyWindow("ALERT")
+# alarm: try text-to-speech "Wake up", fallback to visual flash + beep
+def alarm_wake_up(repeat=1):
+    if HAS_TTS:
+        try:
+            engine = pyttsx3.init()
+            # speak asynchronously in this thread (pyttsx3 blocks runAndWait), so run here
+            for _ in range(repeat):
+                engine.say('Wake up')
+            engine.runAndWait()
+            return
+        except Exception:
+            pass
+    # fallback: show visual alert window and short system beep(s)
+    try:
+        for _ in range(repeat):
+            beep = np.zeros((100, 400, 3), dtype=np.uint8)
+            cv2.putText(beep, 'WAKE UP', (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            cv2.imshow('ALERT', beep)
+            # cross-platform: try to trigger a short sound via ascii bell (may or may not play)
+            print('\a', end='', flush=True)
+            cv2.waitKey(700)
+            try:
+                cv2.destroyWindow('ALERT')
+            except Exception:
+                pass
+    except Exception:
+        # last-resort print
+        for _ in range(repeat):
+            print('*** WAKE UP ***')
 
 # ---------------------- Landmark provider ----------------------
 class LandmarkProvider:
@@ -159,6 +170,8 @@ class DrowsinessDetector:
         self.yawn_frames = 0
         self.alert = False
         self.alert_counter = 0
+        # time-based closed detection
+        self.closed_start_time = None
 
     def crop_eye_patch(self, frame, eye_points, pad=5):
         x_min = max(np.min(eye_points[:,0]) - pad, 0)
@@ -191,6 +204,8 @@ class DrowsinessDetector:
     def analyze_frame(self, frame):
         lm = self.lp.get_landmarks(frame)
         if lm is None:
+            # reset closed timer when no face
+            self.closed_start_time = None
             return frame, False, "No face"
         left = lm['left_eye']
         right = lm['right_eye']
@@ -206,7 +221,17 @@ class DrowsinessDetector:
         self.leftEAR_deque.append(1 if ear < self.adaptive_ear_threshold else 0)
         perclos = sum(self.leftEAR_deque) / len(self.leftEAR_deque)
 
-        # count sustained closures and yawns
+        # time-based sustained closure detection
+        now = time.time()
+        if ear < self.adaptive_ear_threshold:
+            if self.closed_start_time is None:
+                self.closed_start_time = now
+            closed_duration = now - self.closed_start_time
+        else:
+            closed_duration = 0
+            self.closed_start_time = None
+
+        # legacy frame-based counter (kept but not primary)
         if ear < self.adaptive_ear_threshold:
             self.closed_frames += 1
         else:
@@ -233,20 +258,32 @@ class DrowsinessDetector:
         # decision fusion
         is_drowsy = False
         reasons = []
+
+        # 1) long time-based closure (>= CLOSED_SECONDS_THRESHOLD)
+        if closed_duration >= CLOSED_SECONDS_THRESHOLD:
+            is_drowsy = True
+            reasons.append(f'ClosedDuration={closed_duration:.1f}s')
+
+        # 2) legacy frame closure (in case fps unknown)
         if self.closed_frames >= EAR_CONSEC_FRAMES:
             is_drowsy = True
-            reasons.append('Long eye closure')
+            reasons.append('Long eye closure (frames)')
+
+        # 3) PERCLOS
         if perclos > PERCLOS_THRESHOLD:
             is_drowsy = True
             reasons.append(f'PERCLOS={perclos:.2f}')
+
+        # 4) yawning: immediate trigger
         if self.yawn_frames >= YAWN_CONSEC_FRAMES:
             is_drowsy = True
             reasons.append('Yawning')
+
         # combine yawning with medium PERCLOS
         if (mar > MAR_THRESHOLD) and (perclos > (PERCLOS_THRESHOLD * 0.7)):
-            is_drowsy = True
             if 'Yawning' not in reasons:
                 reasons.append('Yawning+PERCLOS')
+            is_drowsy = True
 
         # smoothing: require persistence
         if is_drowsy:
@@ -271,8 +308,10 @@ class DrowsinessDetector:
         cv2.putText(vis, f'MAR={mar:.2f}', (10,90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
         if eye_open_prob is not None:
             cv2.putText(vis, f'EyeOpenProb={eye_open_prob:.2f}', (10,120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+        if closed_duration > 0:
+            cv2.putText(vis, f'ClosedSec={closed_duration:.1f}', (10,150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
         if final_alert:
-            cv2.putText(vis, 'DROWSINESS DETECTED', (10,150), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 3)
+            cv2.putText(vis, 'DROWSINESS DETECTED', (10,180), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 3)
 
         return vis, final_alert, ','.join(reasons)
 
@@ -290,8 +329,10 @@ class DrowsinessDetector:
                 if not ret:
                     break
                 out_frame, is_drowsy, reasons = self.analyze_frame(frame)
+                # trigger alarm when drowsiness confirmed
                 if is_drowsy and not self.alert:
-                    threading.Thread(target=play_beep, daemon=True).start()
+                    # launch TTS or fallback in separate thread so it doesn't block
+                    threading.Thread(target=alarm_wake_up, kwargs={'repeat':2}, daemon=True).start()
                     self.alert = True
                 if not is_drowsy:
                     self.alert = False
