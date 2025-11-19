@@ -65,7 +65,6 @@ def _os_tts_say(text):
                 return True
             return False
         if plat == "Windows":
-            # Use PowerShell System.Speech (works on most Windows installs)
             cmd = [
                 "powershell", "-Command",
                 f"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{text}')"
@@ -116,12 +115,15 @@ def alarm_wake_up(repeat=2, text="Wake up"):
 # ---------------------- MediaPipe Landmark Provider ----------------------
 class LandmarkProvider:
     def __init__(self):
+        # initialize MediaPipe face mesh once
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False, max_num_faces=1, refine_landmarks=True,
             min_detection_confidence=0.5, min_tracking_confidence=0.5
         )
+        # these indices are for MediaPipe's face mesh
         self.left_eye_idx = [33, 160, 158, 133, 153, 144]
         self.right_eye_idx = [362, 385, 387, 263, 373, 380]
+        # mouth indices — keep them consistent with the face mesh indexing
         self.mouth_idx = [78,95,88,178,87,14,317,402,318,324,308,191,80,81,82,13,312,311,415,308]
 
     def get_landmarks(self, frame):
@@ -132,10 +134,17 @@ class LandmarkProvider:
             return None
         lm = res.multi_face_landmarks[0]
         pts = np.array([(int(p.x * w), int(p.y * h)) for p in lm.landmark])
+        # guard against index errors
+        try:
+            left_eye = pts[self.left_eye_idx]
+            right_eye = pts[self.right_eye_idx]
+            mouth = pts[self.mouth_idx]
+        except IndexError:
+            return None
         return {
-            "left_eye": pts[self.left_eye_idx],
-            "right_eye": pts[self.right_eye_idx],
-            "mouth": pts[self.mouth_idx],
+            "left_eye": left_eye,
+            "right_eye": right_eye,
+            "mouth": mouth,
             "face": pts
         }
 
@@ -219,10 +228,10 @@ class DrowsinessDetector:
         # optional TF eye model nudging
         eye_open_prob = None
         if self.eye_model is not None:
-            lp = self.crop_eye_patch(frame, left)
-            rp = self.crop_eye_patch(frame, right)
-            p1 = self.classify_eye(lp)
-            p2 = self.classify_eye(rp)
+            lp_patch = self.crop_eye_patch(frame, left)
+            rp_patch = self.crop_eye_patch(frame, right)
+            p1 = self.classify_eye(lp_patch)
+            p2 = self.classify_eye(rp_patch)
             if p1 is not None and p2 is not None:
                 eye_open_prob = (p1 + p2) / 2.0
                 if eye_open_prob < 0.5:
@@ -347,6 +356,7 @@ def main():
         cap.release()
     except:
         pass
+    # reopen same source (was previously hard-coded to 2); use src instead
     cap = cv2.VideoCapture(src)
 
     eye_model = None
